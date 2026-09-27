@@ -1,0 +1,64 @@
+# Only source, tests, docs and safe templates belong here (2026-09-27).
+
+# Secrets: the real env files. deploy/.env.example is the template and stays tracked.
+.env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# Legacy laptop scripts with the Telegram bot token and the terminals' admin
+# password in plain text (README, DEPLOY.md → Security). They stay on the
+# laptop until the token is revoked and the password changed; never commit them
+# as they are. tests/test_parser_parity.py imports webhook_server.py, so that
+# test needs the local file.
+/webhook_server.py
+/configure_httphost.py
+/migration_fixed.py
+
+# Runtime state of webhook_server.py (staff names and pass times), its temp
+# file and the manual copies taken before filter changes.
+attendance_state*.json
+attendance_state*.tmp
+
+# hikvision-ingest outbox and any other local database.
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Logs, temp files, backups
+*.log
+*.tmp
+*.bak
+*.orig
+
+# IDE / macOS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Graphify knowledge-graph output
+graphify-out/

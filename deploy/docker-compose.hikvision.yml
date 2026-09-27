@@ -1,0 +1,25 @@
+# Added NEXT TO the intranet's compose files on the server, so the service joins
+# the intranet's network (Caddy reaches it, it reaches app:5000):
+#   docker compose --env-file .env.docker -f docker-compose.yml -f /opt/hikvision_webhook/deploy/docker-compose.hikvision.yml up -d --build hikvision-ingest
+# Paths assume this folder is at /opt/hikvision_webhook — adjust `context` and `env_file`.
+services:
+  hikvision-ingest:
+    build:
+      context: /opt/hikvision_webhook
+    restart: unless-stopped
+    env_file: /opt/hikvision_webhook/deploy/.env
+    volumes:
+      - hikvision_ingest_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - phoenix-network
+
+volumes:
+  hikvision_ingest_data:
+    driver: local

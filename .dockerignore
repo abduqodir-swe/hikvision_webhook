@@ -1,0 +1,13 @@
+.venv
+__pycache__
+tests
+*.json
+*.md
+deploy
+webhook_server.py
+configure_httphost.py
+migrate_pins.py
+migration_fixed.py
+hikvision_probe.py
+.DS_Store
+.env*

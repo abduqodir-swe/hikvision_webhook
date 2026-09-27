@@ -1,0 +1,4 @@
+flask>=3.1,<4
+requests>=2.32,<3
+# Only the cloud ingest service needs it (Dockerfile); the laptop webhook_server.py does not.
+gunicorn>=23,<24

@@ -1,0 +1,33 @@
+# Save as caddy-sites/hik.caddy in the intranet folder on the server (the intranet
+# Caddyfile imports caddy-sites/*.caddy and sets default_sni hik.phoenix-math.uz
+# for clients without SNI). Only the HTTPS block; only the push path
+# is public; everything else on this host answers 404. /health stays internal:
+#   docker compose exec hikvision-ingest python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8000/health').read().decode())"
+
+hik.phoenix-math.uz {
+	# An RSA certificate: the face terminal's TLS client may not speak ECDSA
+	# (the Dahua terminal failed HTTPS against an ECDSA-only certificate, see
+	# face attendance/google/TERMINAL_UPLOAD_FORMAT.md).
+	tls {
+		key_type rsa2048
+	}
+	handle /hikvision/* {
+		reverse_proxy hikvision-ingest:8000
+	}
+	handle {
+		respond 404
+	}
+}
+
+# FALLBACK — only with the owner's go-ahead, if the terminal cannot complete HTTPS (DEPLOY.md, 3b).
+# Plain HTTP on port 80 for this host only, no redirect; the path token is the
+# credential, so also turn on digest authentication in the terminal's HTTP Host.
+#
+# http://hik.phoenix-math.uz {
+# 	handle /hikvision/* {
+# 		reverse_proxy hikvision-ingest:8000
+# 	}
+# 	handle {
+# 		respond 404
+# 	}
+# }
