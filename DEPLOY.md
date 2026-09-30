@@ -92,6 +92,13 @@ never switch to plain HTTP silently. Options, in order:
 3. If neither works: a small always-on device on the school LAN (or a router VPN)
    running this same container, with `ERP_URL=https://intranet.phoenix-math.uz`.
 
+## 3c. Second receiver: Phoenix Employee
+
+To feed check-in / check-out to the Phoenix Employee app (Work Mode), set `EMPLOYEE_URL` /
+`EMPLOYEE_KEY` in `deploy/.env` (see `phoenix-employee-app/deploy/DEPLOY.md`) and restart the service.
+Every accepted pass is then delivered to both receivers with separate retry state; `/health` shows
+`employeeConfigured`, `employeePending`, `employeeLastError`. Nothing changes for the intranet.
+
 ## 4. Pilot, then switch off the old paths
 
 1. Run one to two weeks with both HTTP Hosts. Compare the Tabel with the laptop's

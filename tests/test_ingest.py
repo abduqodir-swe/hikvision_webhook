@@ -65,7 +65,7 @@ class IngestTest(unittest.TestCase):
     def rows(self, table="outbox"):
         with closing(sqlite3.connect(self.cfg.db_path)) as c:
             c.row_factory = sqlite3.Row
-            return [dict(r) for r in c.execute(f"SELECT * FROM {table} ORDER BY id")]
+            return [dict(r) for r in c.execute(f"SELECT * FROM {table} ORDER BY rowid")]
 
     def push(self, event, token=TOKEN, picture=None, **kw):
         return self.client.post(f"/hikvision/{token}", data=multipart(event, picture), content_type="multipart/form-data", **kw)
@@ -221,6 +221,50 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(ingest_server.forward_once(cfg, self.store, post=post), 0)
         post.assert_not_called()
 
+    # ── second receiver: Phoenix Employee ─────────────────────────────────
+    def with_employee(self):
+        self.cfg.employee_url, self.cfg.employee_key = "http://employee-api:8080", "e" * 24
+
+    def test_the_employee_app_gets_the_same_scans_with_its_own_key_and_state(self):
+        self.with_employee()
+        self.queue_two()
+        post = mock.Mock(return_value=FakeResponse(200, {"received": 2, "accepted": 2, "unknown": []}))
+        self.assertEqual(ingest_server.forward_employee_once(self.cfg, self.store, post=post), 2)
+        self.assertEqual(post.call_args.args[0], "http://employee-api:8080/api/v1/integrations/hikvision/scans")
+        self.assertEqual(post.call_args.kwargs["headers"], {"X-Integration-Key": "e" * 24})
+        self.assertEqual([s["eventId"] for s in post.call_args.kwargs["json"]["scans"]], ["1", "2"])
+        self.assertTrue(all(r["sent_at"] for r in self.rows("employee_delivery")))
+        self.assertTrue(all(r["sent_at"] is None for r in self.rows()))   # the intranet's delivery is separate
+        self.assertEqual(ingest_server.forward_employee_once(self.cfg, self.store, post=post), 0)
+
+    def test_one_receiver_down_does_not_hold_up_the_other(self):
+        self.with_employee()
+        self.queue_two()
+        ingest_server.forward_employee_once(self.cfg, self.store, post=mock.Mock(return_value=FakeResponse(503, "down")))
+        self.assertEqual(ingest_server.forward_once(self.cfg, self.store, post=mock.Mock(return_value=FakeResponse(200, {}))), 2)
+        self.assertTrue(all(r["sent_at"] for r in self.rows()))
+        emp = self.rows("employee_delivery")
+        self.assertTrue(all(r["sent_at"] is None and r["attempts"] == 1 for r in emp))
+        self.assertEqual(self.client.get("/health").json["employeePending"], 2)
+
+    def test_scans_from_before_the_employee_app_was_configured_are_not_replayed(self):
+        self.queue_two()
+        self.with_employee()
+        self.assertEqual(self.rows("employee_delivery"), [])
+        post = mock.Mock()
+        self.assertEqual(ingest_server.forward_employee_once(self.cfg, self.store, post=post), 0)
+        post.assert_not_called()
+
+    def test_prune_keeps_a_scan_the_employee_app_still_waits_for(self):
+        self.with_employee()
+        self.queue_two()
+        with closing(sqlite3.connect(self.cfg.db_path, isolation_level=None)) as c:
+            c.execute("UPDATE outbox SET sent_at='2020-01-01T00:00:00+00:00'")
+            c.execute("UPDATE employee_delivery SET sent_at='2020-01-01T00:00:00+00:00' WHERE outbox_id=1")
+        self.store.prune(14, 60)
+        self.assertEqual([r["id"] for r in self.rows()], [2])
+        self.assertEqual([r["outbox_id"] for r in self.rows("employee_delivery")], [2])
+
     # ── health and housekeeping ────────────────────────────────────────────
     def test_health_reports_the_backlog_and_the_devices(self):
         self.queue_two()
@@ -249,6 +293,9 @@ class ConfigTest(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             cfg = ingest_server.Config.from_env()
         self.assertEqual(cfg.erp_url, "https://erp.test")
+        self.assertIsNone(cfg.employee_url)
+        with mock.patch.dict(os.environ, {**env, "EMPLOYEE_URL": "http://employee-api:8080/", "EMPLOYEE_KEY": "e" * 24}, clear=True):
+            self.assertEqual(ingest_server.Config.from_env().employee_url, "http://employee-api:8080")
         self.assertEqual(cfg.devices[0].success_event_codes, frozenset({"153"}))
         with mock.patch.dict(os.environ, {"HIK_DEVICES": json.dumps([{"token": "short", "label": "R", "sn": "S"}])}, clear=True):
             with self.assertRaises(ValueError):

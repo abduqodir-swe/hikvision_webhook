@@ -5,6 +5,8 @@
         └─ outbox (SQLite): written BEFORE the terminal gets its 200
         └─ forwarder thread ──► intranet POST /api/integrations/hikvision/scans
                                 (X-Integration-Key = HIKVISION_INTEGRATION_KEY)
+                           └──► Phoenix Employee POST /api/v1/integrations/hikvision/scans
+                                (optional second receiver, EMPLOYEE_URL / EMPLOYEE_KEY; own delivery state)
         └─ Telegram notice (pilot only, fresh passes only, neutral wording)
 
 No attendance business logic lives here (owner, 2026-09-26): no working hours,
@@ -61,6 +63,18 @@ CREATE TABLE IF NOT EXISTS raw_events (
     event TEXT NOT NULL                    -- the terminal's JSON, never the picture
 );
 CREATE INDEX IF NOT EXISTS idx_raw_received ON raw_events (received_at);
+-- Delivery to the second receiver (Phoenix Employee: check-in / check-out for Work Mode). Its own
+-- state, so an outage of one receiver never holds up the other. Only scans received while the
+-- receiver is configured get a row (turning it on later must not replay history as live passes).
+CREATE TABLE IF NOT EXISTS employee_delivery (
+    outbox_id INTEGER PRIMARY KEY REFERENCES outbox(id),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    sent_at TEXT,
+    failed_at TEXT,
+    last_error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_employee_pending ON employee_delivery (sent_at, failed_at, next_attempt_at);
 CREATE TABLE IF NOT EXISTS device_seen (
     device_label TEXT PRIMARY KEY,
     last_request_at TEXT,
@@ -97,6 +111,8 @@ class Config:
     devices: list[Device]
     erp_url: str | None
     erp_key: str | None
+    employee_url: str | None = None   # Phoenix Employee backend (second receiver), e.g. http://employee-api:8080
+    employee_key: str | None = None   # its HIKVISION_INTEGRATION_KEY
     telegram_token: str | None = None
     telegram_chat_ids: list[str] = field(default_factory=list)
     telegram_max_age_s: int = 120
@@ -133,6 +149,8 @@ class Config:
             devices=devices,
             erp_url=(os.environ.get("ERP_URL") or "").rstrip("/") or None,
             erp_key=os.environ.get("ERP_KEY") or None,
+            employee_url=(os.environ.get("EMPLOYEE_URL") or "").rstrip("/") or None,
+            employee_key=os.environ.get("EMPLOYEE_KEY") or None,
             telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN") or None,
             telegram_chat_ids=chat_ids,
             telegram_max_age_s=_env_int("TELEGRAM_MAX_AGE_SECONDS", 120),
@@ -180,12 +198,40 @@ class Store:
                       "last_scan_at=COALESCE(excluded.last_scan_at, device_seen.last_scan_at)",
                       (label, now, now if scan else None))
 
-    def enqueue(self, event_key: str, label: str, payload: dict, occurred_at: datetime) -> bool:
-        """True when new; a re-sent event (same key) is not queued twice."""
+    def enqueue(self, event_key: str, label: str, payload: dict, occurred_at: datetime, employee: bool = False) -> bool:
+        """True when new; a re-sent event (same key) is not queued twice. [employee]: also deliver to Phoenix Employee."""
         with self.conn() as c:
+            c.execute("BEGIN IMMEDIATE")
             cur = c.execute("INSERT OR IGNORE INTO outbox (event_key, device_label, payload, occurred_at, received_at) VALUES (?,?,?,?,?)",
                             (event_key, label, json.dumps(payload, ensure_ascii=False), occurred_at.isoformat(), _now_iso()))
-            return cur.rowcount == 1
+            new = cur.rowcount == 1
+            if new and employee:
+                c.execute("INSERT INTO employee_delivery (outbox_id) VALUES (?)", (cur.lastrowid,))
+            c.execute("COMMIT")
+            return new
+
+    # ── second receiver (Phoenix Employee) ─────────────────────────────────
+    def employee_pending(self, limit: int) -> list[sqlite3.Row]:
+        with self.conn() as c:
+            return c.execute("SELECT o.id, o.payload FROM employee_delivery d JOIN outbox o ON o.id = d.outbox_id "
+                             "WHERE d.sent_at IS NULL AND d.failed_at IS NULL AND d.next_attempt_at <= ? "
+                             "ORDER BY o.id LIMIT ?", (time.time(), limit)).fetchall()
+
+    def employee_mark_sent(self, ids: list[int]) -> None:
+        with self.conn() as c:
+            c.executemany("UPDATE employee_delivery SET sent_at=?, last_error=NULL WHERE outbox_id=?", [(_now_iso(), i) for i in ids])
+
+    def employee_mark_retry(self, ids: list[int], error: str) -> None:
+        with self.conn() as c:
+            for i in ids:
+                row = c.execute("SELECT attempts FROM employee_delivery WHERE outbox_id=?", (i,)).fetchone()
+                attempts = (row["attempts"] if row else 0) + 1
+                c.execute("UPDATE employee_delivery SET attempts=?, next_attempt_at=?, last_error=? WHERE outbox_id=?",
+                          (attempts, time.time() + min(300, 2 ** min(attempts, 8)), error[:500], i))
+
+    def employee_mark_failed(self, ids: list[int], error: str) -> None:
+        with self.conn() as c:
+            c.executemany("UPDATE employee_delivery SET failed_at=?, last_error=? WHERE outbox_id=?", [(_now_iso(), error[:500], i) for i in ids])
 
     def pending(self, limit: int) -> list[sqlite3.Row]:
         with self.conn() as c:
@@ -216,7 +262,10 @@ class Store:
         sent_cut = (now - timedelta(days=sent_days)).isoformat(timespec="seconds")
         with self.conn() as c:
             c.execute("DELETE FROM raw_events WHERE received_at < ?", (raw_cut,))
-            c.execute("DELETE FROM outbox WHERE sent_at IS NOT NULL AND sent_at < ?", (sent_cut,))
+            # A scan still waiting for Phoenix Employee stays, even when the intranet has it.
+            c.execute("DELETE FROM outbox WHERE sent_at IS NOT NULL AND sent_at < ? AND NOT EXISTS "
+                      "(SELECT 1 FROM employee_delivery d WHERE d.outbox_id = outbox.id AND d.sent_at IS NULL AND d.failed_at IS NULL)", (sent_cut,))
+            c.execute("DELETE FROM employee_delivery WHERE outbox_id NOT IN (SELECT id FROM outbox)")
 
     def health(self) -> dict:
         with self.conn() as c:
@@ -224,8 +273,11 @@ class Store:
             failed = c.execute("SELECT COUNT(*) n FROM outbox WHERE failed_at IS NOT NULL").fetchone()
             last_err = c.execute("SELECT last_error FROM outbox WHERE last_error IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
             seen = [dict(r) for r in c.execute("SELECT * FROM device_seen ORDER BY device_label")]
+            emp = c.execute("SELECT COUNT(*) n FROM employee_delivery WHERE sent_at IS NULL AND failed_at IS NULL").fetchone()
+            emp_err = c.execute("SELECT last_error FROM employee_delivery WHERE last_error IS NOT NULL ORDER BY outbox_id DESC LIMIT 1").fetchone()
             return {"pending": pend["n"], "oldestPendingReceivedAt": pend["oldest"], "failed": failed["n"],
-                    "lastError": last_err["last_error"] if last_err else None, "devices": seen}
+                    "lastError": last_err["last_error"] if last_err else None, "devices": seen,
+                    "employeePending": emp["n"], "employeeLastError": emp_err["last_error"] if emp_err else None}
 
 
 # ── Digest authentication of the terminal (optional, per device) ─────────────
@@ -352,11 +404,44 @@ def forward_once(cfg: Config, store: Store, post=requests.post) -> int:
     return 0
 
 
+def forward_employee_once(cfg: Config, store: Store, post=requests.post) -> int:
+    """Send one batch to Phoenix Employee (same shape as the intranet's). Returns how many were delivered."""
+    if not cfg.employee_url or not cfg.employee_key:
+        return 0
+    rows = store.employee_pending(cfg.batch_size)
+    if not rows:
+        return 0
+    ids = [r["id"] for r in rows]
+    try:
+        res = post(f"{cfg.employee_url}/api/v1/integrations/hikvision/scans", json={"scans": [json.loads(r["payload"]) for r in rows]},
+                   headers={"X-Integration-Key": cfg.employee_key}, timeout=20)
+    except requests.RequestException as err:
+        store.employee_mark_retry(ids, f"network: {type(err).__name__}")
+        return 0
+    if res.status_code == 200:
+        store.employee_mark_sent(ids)
+        try:
+            unknown = res.json().get("unknown") or []
+            if unknown:
+                log.info("employee app: %d terminal id(s) not linked to an employee: %s", len(unknown), ", ".join(unknown[:20]))
+        except ValueError:
+            pass
+        return len(ids)
+    if res.status_code == 400:
+        store.employee_mark_failed(ids, f"HTTP 400: {res.text[:300]}")
+    else:
+        store.employee_mark_retry(ids, f"HTTP {res.status_code}: {res.text[:300]}")
+    log.warning("employee app answered HTTP %s", res.status_code)
+    return 0
+
+
 def forwarder_loop(cfg: Config, store: Store, stop: threading.Event) -> None:
     last_prune = 0.0
     while not stop.is_set():
         try:
             while forward_once(cfg, store) and not stop.is_set():
+                pass
+            while forward_employee_once(cfg, store) and not stop.is_set():
                 pass
             if time.time() - last_prune > 3600:
                 store.prune(cfg.raw_retention_days, cfg.sent_retention_days)
@@ -418,7 +503,8 @@ def create_app(cfg: Config | None = None) -> Flask:
             # (log cleared, factory reset) reuses serial numbers for new passes.
             second = int(scan.occurred_at.timestamp())
             key = f"{device.sn}:{scan.event_serial}:{second}" if scan.event_serial else f"{device.sn}:{scan.employee_no}:{second}"
-            new = store.enqueue(key, device.label, scan.to_erp(device.sn, device.label), scan.occurred_at)
+            new = store.enqueue(key, device.label, scan.to_erp(device.sn, device.label), scan.occurred_at,
+                                employee=bool(cfg.employee_url and cfg.employee_key))
         except sqlite3.Error:
             log.exception("outbox write failed")
             return "", 500          # the terminal will send it again
@@ -433,6 +519,7 @@ def create_app(cfg: Config | None = None) -> Flask:
         h = store.health()
         h["ok"] = True
         h["erpConfigured"] = bool(cfg.erp_url and cfg.erp_key)
+        h["employeeConfigured"] = bool(cfg.employee_url and cfg.employee_key)
         h["devices_configured"] = [d.label for d in cfg.devices]
         return jsonify(h)
 

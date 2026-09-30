@@ -2,8 +2,9 @@
 
 **2026-09-26 — new path (production):** the terminal pushes to the cloud
 `hikvision-ingest` service (`ingest_server.py` + `hik_parser.py`), which sends the
-scans to the intranet's staff **Tabel**. No computer at the school, no attendance
-rules here — the intranet decides arrival, departure, late and early. Setup and
+scans to the intranet's staff **Tabel** — and, optionally (`EMPLOYEE_URL`), to the Phoenix Employee
+app for check-in / check-out. No computer at the school, no attendance rules here — the receivers
+decide what a scan means. Setup and
 the pilot: **[DEPLOY.md](DEPLOY.md)**. Tests: `.venv/bin/python -m unittest discover -s tests -t .`
 
 `hik_parser.py` is the parser of `webhook_server.py`, moved without changing its
